@@ -304,6 +304,7 @@ def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
 
     assert actual.tolist() == [4, 5, 10, 11, 12]
 
+
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
     with set_current_vllm_config(
@@ -417,13 +418,23 @@ def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:
     assert calls == [(kv_c, kv_cache, slots)]
 
 
-def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> None:
+def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> None:
     planned: list[SimpleNamespace] = []
+    reservations: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(reserve_all=lambda *specs: reservations.append(specs)),
+    )
 
     class FakeCaps(SimpleNamespace):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
+
+        @staticmethod
+        def shapes_and_dtypes():
+            return ()
 
     class FakeModule:
         Caps = FakeCaps
@@ -437,7 +448,10 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     impl._is_glm_next = True
     impl._module = FakeModule
     impl._kernel_page_size = 64
+    impl._kernel_page_size_finalized = False
     impl._input_num_heads = 64
+    impl.num_heads = 16
+    impl.dcp_world_size = 4
     impl._max_tokens = 4096
     impl._max_seqs = 4
     impl._topk_tokens = 2051
@@ -445,23 +459,60 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     impl._q_head_dim = 512
     impl.kv_lora_rank = 512
     impl._model_type = 1
+    impl._ckv_gather_enabled = True
+    impl._ckv_capacity_tokens = 131200
+    impl._ckv_local_capacity = 131200
     impl._decode_plan = SimpleNamespace()
     impl._extend_plan = SimpleNamespace()
+    impl._ckv_extend_plan = SimpleNamespace()
     owner = SimpleNamespace(impl=impl, indexer=None)
     cache = torch.empty((2, 1, 2304, 528), dtype=torch.uint8)
 
+    MLAAttention.finalize_kv_cache_geometry(
+        owner,
+        SimpleNamespace(cache_config=SimpleNamespace(block_size=2304)),
+    )
     MLAAttention.bind_kv_cache(owner, cache)
 
     assert owner.kv_cache.shape == (2, 2304, 528)
     assert impl._kernel_page_size == 2304
+    assert impl._kernel_page_size_finalized
     assert [(caps.mode, caps.page_size) for caps in planned] == [
         ("decode", 2304),
         ("extend", 2304),
+        ("extend", 2304),
     ]
-    assert [(caps.max_q_rows, caps.max_batch) for caps in planned] == [
-        (4096, 4096),
-        (4096, 4096),
+    plan_geometry = [
+        (caps.num_q_heads, caps.max_q_rows, caps.max_batch) for caps in planned
     ]
+    assert plan_geometry == [
+        (64, 4096, 4096),
+        (64, 4096, 4096),
+        (16, 4096, 4096),
+    ]
+    assert len(reservations) == 3
+    assert reservations[0] == (((4096, 64, 512), torch.bfloat16),)
+    assert reservations[1] == (((4096, 64, 512), torch.bfloat16),)
+    assert reservations[2] == (
+        ((4096, 16, 512), torch.bfloat16),
+        ((131328, 528), torch.uint8),
+        ((525312, 528), torch.uint8),
+    )
+
+    with pytest.raises(RuntimeError, match="immutable after finalization"):
+        impl.finalize_kv_cache_geometry(64)
+    with pytest.raises(RuntimeError, match="does not match the finalized"):
+        impl.bind_kv_cache(torch.empty((2, 64, 528), dtype=torch.uint8))
+
+
+def test_b12x_glm5_next_full_ckv_bind_requires_geometry_finalization() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._ckv_gather_enabled = True
+    impl._kernel_page_size_finalized = False
+
+    with pytest.raises(RuntimeError, match="before KV-cache memory profiling"):
+        impl.bind_kv_cache(torch.empty((2, 2304, 528), dtype=torch.uint8))
 
 
 def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
